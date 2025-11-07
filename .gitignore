@@ -1,0 +1,6 @@
+Manifest.toml
+.vscode/
+*.vtr
+*.vts
+*.jld2
+*.mat
