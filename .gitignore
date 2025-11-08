@@ -1,5 +1,8 @@
-Manifest.toml
+.DS_Store
 .vscode/
+
+Manifest.toml
+
 *.vtr
 *.vts
 *.jld2
