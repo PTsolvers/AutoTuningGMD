@@ -688,7 +688,6 @@ function main_call()
     for i in eachindex(N)
         itPH[i], itDYREL[i], it_nx[i], wtime[i] = Stokes3D_PHDR(; n=N[i], ALE=false, restart=false, restart_step=500, end_step=1)
     end
-    jldsave("Scaling_Balls_1m6_FDM.jld2"; itPH, itDYREL, it_nx, wtime)
     @show itPH
     @show wtime
 end

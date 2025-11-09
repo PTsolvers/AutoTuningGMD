@@ -1,5 +1,6 @@
 # Initialisation
-using Plots, Printf, Statistics, LinearAlgebra, JLD2
+using Printf, Statistics, LinearAlgebra, JLD2
+import Plots as pt
 # Macros
 @views    av(A) = 0.25*(A[1:end-1,1:end-1].+A[2:end,1:end-1].+A[1:end-1,2:end].+A[2:end,2:end])
 @views av_xa(A) =  0.5*(A[1:end-1,:].+A[2:end,:])
@@ -255,25 +256,21 @@ end
         end
         Pt .+= γ_eff.*Rp
     end
+
     # Plotting
-    p1 = heatmap(xc, yc, ∇V' , aspect_ratio=1, c=:inferno, title="∇V", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
-    p2 = heatmap(xc, yc, Pt' , aspect_ratio=1, c=:inferno, title="Pt", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
-    p3 = plot(title="Convergence", xlabel="DR iterations / nx",ylabel="errors") 
-    p3 = plot!(err_evo_it/ncx, log10.(err_evo_V), label="V")
-    p3 = plot!(err_evo_it/ncx, log10.(err_evo_P), label="P")
-    # p3 = plot!(err_evo_it/ncx, log10.(ϵ.*ones(size(err_evo_it))), label="tol")  
-    p4 = heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
-    display(plot(p1, p2, p3, p4))
+    p1 = pt.heatmap(xc, yc, ∇V' , aspect_ratio=1, c=:inferno, title="∇V", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
+    p2 = pt.heatmap(xc, yc, Pt' , aspect_ratio=1, c=:inferno, title="Pt", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
+    p3 = pt.plot(title="Convergence", xlabel="DR iterations / nx",ylabel="errors") 
+    p3 = pt.plot!(err_evo_it/ncx, log10.(err_evo_V), label="V")
+    p3 = pt.plot!(err_evo_it/ncx, log10.(err_evo_P), label="P")
+    p4 = pt.heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
+    display(pt.plot(p1, p2, p3, p4))
+
     @show iter/ncx
     n   = length(ηc)
     @show η_h = 1.0 / sum(1.0/n ./ηc)
     @show η_g = exp( sum( 1.0/n*log.(ηc)))
     @show η_a = mean(ηc)
-
-    # save("./results/compressible_K2e0_PH.jld2", "err_evo_it", err_evo_it, "ncx", ncx, "err_evo_V", err_evo_V, "err_evo_P", err_evo_P, "xc", xc, "yc", yc, "∇V", ∇V )
-    # save("./results/compressible_K2e3_PH.jld2", "err_evo_it", err_evo_it, "ncx", ncx, "err_evo_V", err_evo_V, "err_evo_P", err_evo_P, "xc", xc, "yc", yc, "∇V", ∇V )
-    # save("./results/compressible_K2e0_1step.jld2", "err_evo_it", err_evo_it, "ncx", ncx, "err_evo_V", err_evo_V, "err_evo_P", err_evo_P, "xc", xc, "yc", yc, "∇V", ∇V )
-    # save("./results/compressible_K2e3_1step.jld2", "err_evo_it", err_evo_it, "ncx", ncx, "err_evo_V", err_evo_V, "err_evo_P", err_evo_P, "xc", xc, "yc", yc, "∇V", ∇V )
 
     return
 end

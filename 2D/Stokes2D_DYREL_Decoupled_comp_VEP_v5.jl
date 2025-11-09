@@ -379,7 +379,7 @@ end
         p1 = pt.heatmap(xc, yc, log10.(EIIc'./sc.t) , aspect_ratio=1, c=:inferno, title="EII", xlims=(-Lx/2,Lx/2), xlabel="x",ylabel="y")
         p2 = pt.heatmap(xc, yc, Pt'.*sc.σ , aspect_ratio=1, c=:inferno, title="Pt", xlims=(-Lx/2,Lx/2), xlabel="x",ylabel="y")
         p3 = pt.plot(1:it, Tii_evo[1:it]*sc.σ, xlabel="time",ylabel="mean dev. stress", label=:none)
-        p4 = heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2))
+        p4 = pt.heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2))
         display(pt.plot(p1, p2, p3, p4))
         @show iter/ncx
         @show itg

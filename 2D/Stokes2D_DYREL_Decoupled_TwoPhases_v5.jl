@@ -295,6 +295,7 @@ end
         end
         Pt .+= γ_eff.*RPt
     end
+
     # Plotting
     p1 = pt.heatmap(xc, yc, Pf[2:end-1,2:end-1]' , aspect_ratio=1, c=:inferno, title="Pf", xlims=(-Lx/2,Lx/2), xlabel="x",ylabel="y")
     p2 = pt.heatmap(xc, yc, Pt' , aspect_ratio=1, c=:inferno, title="Pt", xlims=(-Lx/2,Lx/2), xlabel="x",ylabel="y")
@@ -305,13 +306,12 @@ end
     p3 = pt.plot!(err_evo_it/ncx, log10.(ϵ.*ones(size(err_evo_it))), label="tol")  
     p4 = pt.heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2), xlabel="x",ylabel="y")
     display(pt.plot(p1, p2, p3, p4))
+
     @show iter/ncx
     n   = length(ηc)
     @show η_h = 1.0 / sum(1.0/n ./ηc)
     @show η_g = exp( sum( 1.0/n*log.(ηc)))
     @show η_a = mean(ηc)
-
-    save("./results/twophases_n$(ncx).jld2", "err_evo_it", err_evo_it, "ncx", ncx, "err_evo_V", err_evo_V, "err_evo_Pt", err_evo_Pt, "err_evo_Pf", err_evo_Pf, "xc", xc, "yc", yc, "∇V", ∇V, "Pt", Pt, "Pf", Pf, "Vx", Vx, "Vy", Vy )
 
     return
 end
