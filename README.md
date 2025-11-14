@@ -18,3 +18,6 @@ FD and FCFV models of incompressible Stokes flow with many inclusions of variabl
 2. Open the folder in a dedicated VScode window 
 3. Open Julia's REPL and type to switch to package mode: `]`
 5. Install all necessary dependencies, type: `instantiate`
+
+## Known issue
+Some script rely on [ParallelStencil](https://github.com/omlins/ParallelStencil.jl). Scripts that initialize ParallelStencil in 2D and scripts that used 3D cannot be run within the same Julia session because of the macro-based design of ParallelStencil. Instead, Julia needs to be restarted to account for the differrent macros in 2D and 3D. 
