@@ -1,5 +1,7 @@
 # AutoTuningGMD
 
+[![DOI](https://zenodo.org/badge/1091941098.svg)](https://doi.org/10.5281/zenodo.17669385)
+
 This repository archives scripts that allow to reproduce results of the submitted manuscript to Geoscientific Model Development.
 Automatic Dynamic Relaxation (DR) and Powell-Hestenes / Dynamic Relaxation (PHDR) solvers using Finite Difference (FD) and Face-Centered Finite Volume (FCFV) discretisations.
 
