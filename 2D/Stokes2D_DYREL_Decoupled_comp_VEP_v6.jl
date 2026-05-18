@@ -1,3 +1,5 @@
+# Achtung: α and β labels are interverted w.r.t to the manuscript  
+
 # Initialisation
 using Plots, Printf, Statistics, LinearAlgebra, JLD2
 # Macros

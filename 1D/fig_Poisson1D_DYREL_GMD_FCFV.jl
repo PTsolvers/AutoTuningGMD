@@ -1,3 +1,5 @@
+# Achtung: α and β labels are interverted w.r.t to the manuscript  
+
 using CairoMakie, LinearAlgebra, MathTeXEngine
 Makie.update_theme!( fonts = (regular = texfont(), bold = texfont(:bold), italic = texfont(:italic)))
 

@@ -1,3 +1,5 @@
+# Achtung: α and β labels are interverted w.r.t to the manuscript  
+
 # Initialisation
 using Printf, Statistics, LinearAlgebra, JLD2
 import Plots as pt
