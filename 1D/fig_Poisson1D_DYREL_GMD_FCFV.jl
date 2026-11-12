@@ -329,21 +329,20 @@ let
 
     ax4 = Axis(fig[2, 2], title=L"$$ (d) Scaling", xlabel=L"$\log_{10}$ resolution", ylabel=L"$\log_{10}$ iterations")
 
-    ncx = 100:100:2000
-    iter_count = zeros(length(ncx)) 
+    ncx             = 100:100:2000
+    iter_count_FD   = zeros(length(ncx)) 
     iter_count_FCFV = zeros(length(ncx)) 
 
     for n in eachindex(ncx)
         sol, err_vec, iter_vec = main_FD(; ncx=ncx[n], variable_coefficient=true, preconditioning=true, tol=1e-10, c_fact=c_fact, nout=100)
-        iter_count[n] = maximum(iter_vec)
+        iter_count_FD[n]   = maximum(iter_vec)
         sol, err_vec, iter_vec = main_FCFV(; ncx=ncx[n], variable_coefficient=true, preconditioning=true, tol=1e-10, c_fact=c_fact, nout=100)
         iter_count_FCFV[n] = maximum(iter_vec)
     end
 
-    scatter!(ax4, log10.(ncx), log10.(iter_count), color=:blue, label=L"$$FDM")
+    scatter!(ax4, log10.(ncx), log10.(iter_count_FD), color=:blue, label=L"$$FDM")
     lines!(ax4, log10.(ncx), log10.(ncx).+1, linestyle=:dash, color=:black, label=L"$$O(1)")
     lines!(ax4, log10.(ncx), log10.(iter_count_FCFV), color=:black, label=L"$$FCFV")
-    # lines!(ax4, log10.(ncx), log10.(ncx.^2), label=L"$$ncx = 800", linestyle=:dashdot)
     ylims!(2.9,5.2)
     axislegend(ax4, position = :lt, framevisible=false, labelsize=14, nbanks=2)  # right-top
 
