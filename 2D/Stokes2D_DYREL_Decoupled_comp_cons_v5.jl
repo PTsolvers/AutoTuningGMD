@@ -1,4 +1,7 @@
-# Achtung: α and β labels are interverted w.r.t to the manuscript  
+# Notation follows the GMD article (https://gmd.copernicus.org/articles/19/5343/2026/), Eqs. (16)-(17):
+#   ∂V∂τ ← β ∂V∂τ + P⁻¹ R      with β = (2 - cΔτ)/(2 + cΔτ)
+#   V    ← V + α ∂V∂τ          with α = 2Δτ²/(2 + cΔτ)
+# (same as 1D/Poisson1D_NonLinear.jl; α, β, c and Δτ are scalars, P = diag(PCx, PCy))
 
 # Initialisation
 using Printf, Statistics, LinearAlgebra, JLD2
@@ -18,7 +21,81 @@ import Plots as pt
     V∇X           .= 0.5.*(gx[1:end-1,:] .+ gx[2:end,:] .+ gy[:,1:end-1] .+ gy[:,2:end])
 end
 
-# can be replaced by AD
+"""
+Momentum residuals (Rx, Ry) for given velocities (Vx, Vy), including the Powell-Hestenes term -γ_eff*Rp.
+For fixed Pt (hence ρ), Pt0 and ρ0 the residual is affine in (Vx, Vy), for the 3 forms of the continuity equation.
+Work arrays and fields are in `A`, parameters in `p`. Rp, strain rates and stresses are updated in `A`.
+"""
+@views function Residual_Stokes2D!(Rx, Ry, Vx, Vy, A, p)
+    (; Rp, ∇V, ∇ρV, V∇X, gx, gy, ρ, ρx, ρy, ρ0, Pt, Pt0, Exx, Eyy, Exy, Txx, Tyy, Txy, ηc, ηv, K, γ_eff) = A
+    (; ρref, Δt, Δx, Δy, comp, form) = p
+    # Boundaries
+    Vx[:,1] .= Vx[:,2]; Vx[:,end] .= Vx[:,end-1]
+    Vy[1,:] .= Vy[2,:]; Vy[end,:] .= Vy[end-1,:]
+    # Divergence 
+    ∇V    .= (Vx[2:end,2:end-1] .- Vx[1:end-1,2:end-1])./Δx .+ (Vy[2:end-1,2:end] .- Vy[2:end-1,1:end-1])./Δy
+    # density
+    ρ     .= ρref .* exp.(Pt./K)
+    ρx[2:end-1,:] .= av_xa(ρ)
+    ρy[:,2:end-1] .= av_ya(ρ)
+    ρx[[1,end],:] .= ρ[[1,end],:]
+    ρy[:,[1,end]] .= ρ[:,[1,end]]
+    # mass flux
+    ∇ρV .=  ( ρx[2:end,:].*Vx[2:end,2:end-1] .-ρx[1:end-1,:].*Vx[1:end-1,2:end-1])./Δx .+ (ρy[:,2:end].*Vy[2:end-1,2:end] .- ρy[:,1:end-1].*Vy[2:end-1,1:end-1])./Δy
+    # Deviatoric strain rate
+    Exx   .= (Vx[2:end,2:end-1] .- Vx[1:end-1,2:end-1])./Δx .- 1.0/3.0.*∇V
+    Eyy   .= (Vy[2:end-1,2:end] .- Vy[2:end-1,1:end-1])./Δy .- 1.0/3.0.*∇V
+    Exy   .= 0.5.*((Vx[:,2:end] .- Vx[:,1:end-1])./Δy .+ (Vy[2:end,:] .- Vy[1:end-1,:])./Δx)
+    # Continuity residual
+    if form == 1
+        advection!(V∇X, gx, gy, Pt, Vx, Vy, Δx, Δy)
+        Rp    .= .-∇V .- comp*((Pt .- Pt0)./Δt .+ V∇X)./K
+    elseif form == 2
+        advection!(V∇X, gx, gy, log.(ρ), Vx, Vy, Δx, Δy)
+        Rp    .= .-∇V .- comp*((log.(ρ) .- log.(ρ0))./Δt .+ V∇X)
+    elseif form == 3
+        Rp    .= (.-∇ρV .- comp*(ρ .- ρ0)./Δt) ./ ρ
+    end
+    # "Deviatoric" stress: includes Powell-Hestenes numerical bulk viscosity
+    Txx   .= 2.0.*ηc.*Exx .- γ_eff .* Rp
+    Tyy   .= 2.0.*ηc.*Eyy .- γ_eff .* Rp
+    Txy   .= 2.0.*ηv.*Exy 
+    # Residuals (PH residuals = true residuals once Pt .+= γ_eff.*Rp is applied)
+    Rx    .= (.-(Pt[2:end,:] .- Pt[1:end-1,:])./Δx .+ (Txx[2:end,:] .- Txx[1:end-1,:])./Δx .+ (Txy[2:end-1,2:end] .- Txy[2:end-1,1:end-1])./Δy)
+    Ry    .= (.-(Pt[:,2:end] .- Pt[:,1:end-1])./Δy .+ (Tyy[:,2:end] .- Tyy[:,1:end-1])./Δy .+ (Txy[2:end,2:end-1] .- Txy[1:end-1,2:end-1])./Δx)
+    return nothing
+end
+
+"""
+Matrix-free probing of the affine momentum residual R(V) = J V + r (same as `probe` in 1D/Poisson1D_NonLinear.jl).
+Each row of Rx/Ry couples Vx and Vy within a 3x3 neighbourhood, so colour vectors with period S = 3 in x and y,
+applied separately to Vx and Vy, give J e_c = R(e_c) - R(0) without overlap, hence diag(J) and the absolute
+row sums Σ_j |J_ij| in 2*S² residual evaluations. Boundary velocities (Dirichlet) are left untouched.
+Returns the diagonal preconditioner PC = -diag(J) and the Gershgorin estimate λmax = Σ_j |J_ij| / PC.
+"""
+@views function preconditioner_and_λmax(res!, Vx, Vy, args...; S=3)
+    Vx, Vy  = copy(Vx), copy(Vy)            # work copies: the solution arrays are left untouched
+    Vxi, Vyi = Vx[2:end-1,2:end-1], Vy[2:end-1,2:end-1]     # unknowns
+    Rx0, Ry0 = zeros(size(Vxi)), zeros(size(Vyi))
+    Rxp, Ryp = zeros(size(Vxi)), zeros(size(Vyi))
+    Dx,  Dy  = zeros(size(Vxi)), zeros(size(Vyi))
+    Ax,  Ay  = zeros(size(Vxi)), zeros(size(Vyi))
+    Vxi .= 0.0; Vyi .= 0.0
+    res!(Rx0, Ry0, Vx, Vy, args...)
+    for (Vi, D) in ((Vxi, Dx), (Vyi, Dy)), cx in 1:S, cy in 1:S
+        Vxi .= 0.0; Vyi .= 0.0
+        Vi[cx:S:end, cy:S:end] .= 1.0
+        res!(Rxp, Ryp, Vx, Vy, args...)
+        Rxp .-= Rx0; Ryp .-= Ry0
+        D[cx:S:end, cy:S:end] .= (Vi === Vxi ? Rxp : Ryp)[cx:S:end, cy:S:end]
+        Ax  .+= abs.(Rxp)
+        Ay  .+= abs.(Ryp)
+    end
+    PCx, PCy = .-Dx, .-Dy
+    return PCx, PCy, Ax./PCx, Ay./PCy
+end
+
+# Analytical alternative (form 1 without advection; kept for comparison, see `probing` switch)
 function Gershgorin_Stokes2D_SchurComplement(ηc, ηv, γ, Δx, Δy, ncx  ,ncy)
         
     ηN    = ones(ncx-1, ncy)
@@ -93,8 +170,9 @@ end
     ϵ        = 1e-8         # tolerance
     iterMax  = 1e5          # max number of iters
     nout     = 100          # check frequency
-    c_fact   = 0.5          # damping factor
-    dτ_local = true         # helps a little bit sometimes, sometimes not! 
+    c_fact   = 0.9          # damping factor: c = 2*sqrt(λmin)*c_fact (0.25 with the former λmin estimate)
+    𝐶        = 0.99         # safety factor on the pseudo time step: Δτ = 2/sqrt(λmax)*𝐶
+    probing  = true         # preconditioner and λmax from probing the residual (false: analytical Gershgorin)
     γfact    = 60           # penalty: multiplier to the arithmetic mean of η
     rel_drop = 1e-3         # relative drop of velocity residual per PH iteration
     # Preprocessing
@@ -113,8 +191,8 @@ end
     gy      = zeros(ncx  ,ncy+1)
     Vx      = zeros(ncx+1,ncy+2) 
     Vy      = zeros(ncx+2,ncy+1)
-    dVx     = zeros(ncx-1,ncy  )
-    dVy     = zeros(ncx  ,ncy-1)
+    ΔVx     = zeros(ncx-1,ncy  )
+    ΔVy     = zeros(ncx  ,ncy-1)
     Exx     = zeros(ncx  ,ncy  )
     Eyy     = zeros(ncx  ,ncy  )
     Exy     = zeros(ncx+1,ncy+1)
@@ -126,14 +204,8 @@ end
     Rp      = zeros(ncx  ,ncy  )
     Rx0     = zeros(ncx-1,ncy  )
     Ry0     = zeros(ncx  ,ncy-1)
-    dVxdτ   = zeros(ncx-1,ncy  )
-    dVydτ   = zeros(ncx  ,ncy-1)
-    βVx     = zeros(ncx-1,ncy  )
-    βVy     = zeros(ncx  ,ncy-1)
-    cVx     = zeros(ncx-1,ncy  )  # this disappears is dτ is not local
-    cVy     = zeros(ncx  ,ncy-1)  # this disappears is dτ is not local
-    αVx     = zeros(ncx-1,ncy  )  # this disappears is dτ is not local
-    αVy     = zeros(ncx  ,ncy-1)  # this disappears is dτ is not local
+    ∂Vx∂τ   = zeros(ncx-1,ncy  )
+    ∂Vy∂τ   = zeros(ncx  ,ncy-1)
     K       = zeros(ncx  ,ncy  )
     ηc      = zeros(ncx  ,ncy  )
     ηv      = zeros(ncx+1,ncy+1)
@@ -178,21 +250,18 @@ end
     end
     ##########################################
 
-    # Optimal pseudo-time steps - can be replaced by AD
-    Dx, Dy, λmaxVx, λmaxVy = Gershgorin_Stokes2D_SchurComplement(ηc, ηv, γ_eff, Δx, Δy, ncx ,ncy)
-    # Select dτ
-    𝐶 = 0.99
-    if dτ_local
-        dτVx =  2.0./sqrt.(λmaxVx)*𝐶
-        dτVy =  2.0./sqrt.(λmaxVy)*𝐶
-    else
-        dτVx =  2.0./sqrt.(maximum(λmaxVx))*𝐶 
-        dτVy =  2.0./sqrt.(maximum(λmaxVy))*𝐶
-    end
-    βVx .= 2 .* dτVx ./ (2 .+ cVx.*dτVx)
-    βVy .= 2 .* dτVy ./ (2 .+ cVy.*dτVy)
-    αVx .= (2 .- cVx.*dτVx) ./ (2 .+ cVx.*dτVx)
-    αVy .= (2 .- cVy.*dτVy) ./ (2 .+ cVy.*dτVy)
+    # Fields and parameters needed by the residual function
+    A = (; Rp, ∇V, ∇ρV, V∇X, gx, gy, ρ, ρx, ρy, ρ0, Pt, Pt0, Exx, Eyy, Exy, Txx, Tyy, Txy, ηc, ηv, K, γ_eff)
+    p = (; ρref, Δt, Δx, Δy, comp, form)
+    # Diagonal preconditioner and Gershgorin estimate of λmax (preconditioned system)
+    PCx, PCy, λmaxVx, λmaxVy = Gershgorin_Stokes2D_SchurComplement(ηc, ηv, γ_eff, Δx, Δy, ncx ,ncy)
+    # Pseudo time step is proportional to λmax (e.g., Oakley, 1995)
+    Δτ = 2.0/sqrt(max(maximum(λmaxVx), maximum(λmaxVy)))*𝐶
+    # Damping coefficient is proportional to λmin (e.g., Oakley, 1995)
+    λmin = 0.0          # wild guess
+    c    = 2*sqrt(λmin)*c_fact
+    α    = 2*Δτ^2/(2 + c*Δτ)
+    β    = (2 - c*Δτ)/(2 + c*Δτ)
     # Initial condition
     Vx     .=   εbg.*xv .+    0*yce'
     Vy     .=     0*xce .- εbg.*yv'
@@ -211,11 +280,20 @@ end
         ρ0   .= ρ
         # Iteration loop
         errVx0 = 1.0;  errVy0 = 1.0;  errPt0 = 1.0 
-        errVx00= 1.0;  errVy00= 1.0; 
+        errVx00= 1.0;  errVy00= 1.0;
         iter=1; err_PT=2*ϵ; err_glob = 1.0
         for itPH = 1:50
             if (err_glob<ϵ) break end
             err_PT = 1.0
+            if probing
+                # Diagonal preconditioner and maximum eigenvalue (preconditioned system), from probing.
+                # Re-evaluated after each pressure update: the Jacobian depends on Pt through ρ and the advection terms
+                PCx, PCy, λmaxVx, λmaxVy = preconditioner_and_λmax(Residual_Stokes2D!, Vx, Vy, A, p)
+                # Pseudo time step is proportional to λmax (e.g., Oakley, 1995)
+                Δτ = 2.0/sqrt(max(maximum(λmaxVx), maximum(λmaxVy)))*𝐶
+                α  = 2*Δτ^2/(2 + c*Δτ)
+                β  = (2 - c*Δτ)/(2 + c*Δτ)
+            end
             # Set tolerance of velocity solve proportional to residual
             ϵ_vel = err_glob*rel_drop
             itPT = 0.
@@ -224,46 +302,14 @@ end
                 # Pseudo-old dudes 
                 Rx0   .= Rx
                 Ry0   .= Ry
-                # Boundaries
-                Vx[:,1] .= Vx[:,2]; Vx[:,end] .= Vx[:,end-1]
-                Vy[1,:] .= Vy[2,:]; Vy[end,:] .= Vy[end-1,:]
-                # Divergence 
-                ∇V    .= (Vx[2:end,2:end-1] .- Vx[1:end-1,2:end-1])./Δx .+ (Vy[2:end-1,2:end] .- Vy[2:end-1,1:end-1])./Δy
-                # density
-                ρ     .= ρref .* exp.(Pt./K)
-                ρx[2:end-1,:] .= av_xa(ρ)
-                ρy[:,2:end-1] .= av_ya(ρ)
-                ρx[[1,end],:] .= ρ[[1,end],:]
-                ρy[:,[1,end]] .= ρ[:,[1,end]]
-                # mass flux
-                ∇ρV .=  ( ρx[2:end,:].*Vx[2:end,2:end-1] .-ρx[1:end-1,:].*Vx[1:end-1,2:end-1])./Δx .+ (ρy[:,2:end].*Vy[2:end-1,2:end] .- ρy[:,1:end-1].*Vy[2:end-1,1:end-1])./Δy
-                # Deviatoric strain rate
-                Exx   .= (Vx[2:end,2:end-1] .- Vx[1:end-1,2:end-1])./Δx .- 1.0/3.0.*∇V
-                Eyy   .= (Vy[2:end-1,2:end] .- Vy[2:end-1,1:end-1])./Δy .- 1.0/3.0.*∇V
-                Exy   .= 0.5.*((Vx[:,2:end] .- Vx[:,1:end-1])./Δy .+ (Vy[2:end,:] .- Vy[1:end-1,:])./Δx)
-                # Continuity residual
-                if form == 1
-                    advection!(V∇X, gx, gy, Pt, Vx, Vy, Δx, Δy)
-                    Rp    .= .-∇V .- comp*((Pt .- Pt0)./Δt .+ V∇X)./K
-                elseif form == 2
-                    advection!(V∇X, gx, gy, log.(ρ), Vx, Vy, Δx, Δy)
-                    Rp    .= .-∇V .- comp*((log.(ρ) .- log.(ρ0))./Δt .+ V∇X)
-                elseif form == 3
-                    Rp    .= (.-∇ρV .- comp*(ρ .- ρ0)./Δt) ./ ρ
-                end
-                # "Deviatoric" stress: includes Powell-Hestenes numerical bulk viscosity
-                Txx   .= 2.0.*ηc.*Exx .- γ_eff .* Rp
-                Tyy   .= 2.0.*ηc.*Eyy .- γ_eff .* Rp
-                Txy   .= 2.0.*ηv.*Exy 
-                # Residuals (PH residuals = true residuals once Pt .+= γ_eff.*Rp is applied)
-                Rx    .= (.-(Pt[2:end,:] .- Pt[1:end-1,:])./Δx .+ (Txx[2:end,:] .- Txx[1:end-1,:])./Δx .+ (Txy[2:end-1,2:end] .- Txy[2:end-1,1:end-1])./Δy)
-                Ry    .= (.-(Pt[:,2:end] .- Pt[:,1:end-1])./Δy .+ (Tyy[:,2:end] .- Tyy[:,1:end-1])./Δy .+ (Txy[2:end,2:end-1] .- Txy[1:end-1,2:end-1])./Δx)
+                # Residuals
+                Residual_Stokes2D!(Rx, Ry, Vx, Vy, A, p)
                 # Damping-pong + preconditioning
-                dVxdτ .= αVx.*dVxdτ .+ Rx ./ Dx
-                dVydτ .= αVy.*dVydτ .+ Ry ./ Dy
+                ∂Vx∂τ .= β.*∂Vx∂τ .+ Rx./PCx      # Achtung: preconditioned system
+                ∂Vy∂τ .= β.*∂Vy∂τ .+ Ry./PCy
                 # PT updates
-                Vx[2:end-1,2:end-1] .+= dVxdτ.*βVx.*dτVx 
-                Vy[2:end-1,2:end-1] .+= dVydτ.*βVy.*dτVy 
+                Vx[2:end-1,2:end-1] .+= α.*∂Vx∂τ
+                Vy[2:end-1,2:end-1] .+= α.*∂Vy∂τ
                 # Residual check
                 if mod(iter, nout)==0 || iter==1
                     # Error norms
@@ -286,16 +332,16 @@ end
                     ePt = min(errPt/sqrt(length(Rp)), errPt/errPt0)
                     err_glob = maximum([eVx, eVy, ePt])
                     verbose && itPT && @printf("---> itPH = %02d iter = %06d iter/nx = %03d, err PT = %1.3e, err glob = %1.3e norm[Rx=%1.3e, Ry=%1.3e, Rp=%1.3e]\n", itPH, iter, iter/ncx, err_PT, err_glob, eVx, eVy, ePt)
-                    dVx .= dVxdτ.*βVx.*dτVx
-                    dVy .= dVydτ.*βVy.*dτVy
+                    # Increment that produced R - R0 (α, β unchanged since then): ΔV = α ∂V∂τ_old = (α/β)(∂V∂τ - R/PC)
+                    ΔVx .= (α/β).*(∂Vx∂τ .- Rx./PCx)
+                    ΔVy .= (α/β).*(∂Vy∂τ .- Ry./PCy)
                     # Compute auto-PT parameters
-                    λminV  = abs(  sum(dVx.*(Rx .- Rx0)) + sum(dVy.*(Ry .- Ry0))  ) / (sum(dVx.*Dx.*dVx) .+ sum(dVy.*Dy.*dVy))
-                    cVx .= 2*sqrt.(λminV)*c_fact*0.5
-                    cVy .= 2*sqrt.(λminV)*c_fact*0.5
-                    βVx .= 2 .* dτVx ./ (2 .+ cVx.*dτVx)
-                    βVy .= 2 .* dτVy ./ (2 .+ cVy.*dτVy)
-                    αVx .= (2 .- cVx.*dτVx) ./ (2 .+ cVx.*dτVx)
-                    αVy .= (2 .- cVy.*dτVy) ./ (2 .+ cVy.*dτVy)
+                    # Rayleigh quotient (e.g., Joldes et al., 2011) - skipped at iter 1 (ΔV = 0 and R - R0 polluted by the Pt update)
+                    (iter > 1) && (λmin = abs(  sum(ΔVx.*(Rx .- Rx0)) + sum(ΔVy.*(Ry .- Ry0))  ) / (sum(ΔVx.*PCx.*ΔVx) + sum(ΔVy.*PCy.*ΔVy)))
+                    # Dynamic evaluation of PT iteration parameters
+                    c = 2*sqrt(λmin)*c_fact
+                    α = 2*Δτ^2/(2 + c*Δτ)
+                    β = (2 - c*Δτ)/(2 + c*Δτ)
                 end
                 iter += 1 
             end
