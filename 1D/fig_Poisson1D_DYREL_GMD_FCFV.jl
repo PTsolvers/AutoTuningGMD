@@ -194,6 +194,7 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
             push!(err_vec, err)
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
+            ardr && continue
             # Rayleigh quotient (e.g., Joldes et al., 2011)
             (iter > 1 && !ardr) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters
@@ -284,6 +285,7 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout,
             push!(err_vec, err)
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
+            ardr && continue
             # Rayleigh quotient (e.g., Joldes et al., 2011)
             (iter > 1 && !ardr) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters
@@ -375,4 +377,41 @@ let
 
     display(fig)
     save("./img/BasicDyRel.png", fig, px_per_unit = 4) 
+end
+#-------------------------------------------------------#
+# Comparison DYREL (λmin-based damping) vs AR-DR (β ramp + adaptive restart)
+
+let
+    c_fact = 0.9
+    run(main, ncx, ardr) = main(; ncx=ncx, variable_coefficient=true, preconditioning=true, tol=1e-10, c_fact=c_fact, nout=100, ardr=ardr)
+
+    fig = Figure(size = (1000, 450), fontsize=18)
+
+    # (a) Convergence history (FD: DYREL solid, AR-DR dashed)
+    ax1 = Axis(fig[1, 1], title=L"$$ (a) Convergence history (FD)", xlabel=L"$10^3$ iterations", ylabel=L"$\log_{10}$ relative residual")
+    for (ncx, col) in ((200, :blue), (400, :green), (800, :orange))
+        _, err_vec, iter_vec = run(main_FD, ncx, false)
+        lines!(ax1, iter_vec./1000, log10.(err_vec), color=col, label=L"$$DYREL, ncx = %$(ncx)")
+        _, err_vec, iter_vec = run(main_FD, ncx, true)
+        lines!(ax1, iter_vec./1000, log10.(err_vec), color=col, linestyle=:dash, label=L"$$AR-DR, ncx = %$(ncx)")
+    end
+    axislegend(ax1, position = :rt, framevisible=false, labelsize=12)
+
+    # (b) Scaling of the iteration count with resolution
+    ax2 = Axis(fig[1, 2], title=L"$$ (b) Scaling", xlabel=L"$\log_{10}$ resolution", ylabel=L"$\log_{10}$ iterations")
+    ncx  = 100:100:2000
+    iters = Dict((m, a) => zeros(length(ncx)) for m in (:FD, :FCFV), a in (false, true))
+    for n in eachindex(ncx), a in (false, true)
+        iters[(:FD,   a)][n] = maximum(run(main_FD,   ncx[n], a)[3])
+        iters[(:FCFV, a)][n] = maximum(run(main_FCFV, ncx[n], a)[3])
+    end
+    scatter!(ax2, log10.(ncx), log10.(iters[(:FD,   false)]), color=:blue, label=L"$$DYREL FDM")
+    lines!(  ax2, log10.(ncx), log10.(iters[(:FCFV, false)]), color=:blue, label=L"$$DYREL FCFV")
+    scatter!(ax2, log10.(ncx), log10.(iters[(:FD,   true)]),  color=:red, marker=:utriangle, label=L"$$AR-DR FDM")
+    lines!(  ax2, log10.(ncx), log10.(iters[(:FCFV, true)]),  color=:red, label=L"$$AR-DR FCFV")
+    lines!(  ax2, log10.(ncx), log10.(ncx).+1, linestyle=:dash, color=:black, label=L"$$O(1)")
+    axislegend(ax2, position = :lt, framevisible=false, labelsize=12)
+
+    display(fig)
+    save("./img/BasicDyRel_vs_ARDR.png", fig, px_per_unit = 4)
 end
