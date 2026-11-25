@@ -1,0 +1,262 @@
+# Notation follows the GMD article (https://gmd.copernicus.org/articles/19/5343/2026/), Eqs. (16)-(17):
+#   ∂u∂τ ← β ∂u∂τ + P⁻¹ R      with β = (2 - cΔτ)/(2 + cΔτ)
+#   u    ← u + α ∂u∂τ          with α = 2Δτ²/(2 + cΔτ)
+
+using CairoMakie, LinearAlgebra, MathTeXEngine
+Makie.update_theme!( fonts = (regular = texfont(), bold = texfont(:bold), italic = texfont(:italic)))
+
+# Poisson equation
+# q = -k*dTdx
+# 0 = dqdx - b x
+
+@views function non_linearity!(k, ∂u∂x, u, k_ref, Δx; n=0.9, ε=1e-6)
+    ∂u∂x  .= diff(u, dims=1) / Δx
+    k     .= k_ref .* (∂u∂x.^2 .+ ε^2).^((1/n-1)/2)  .+ k_ref
+end
+
+"""
+Matrix-free probing of an affine residual R(u) = A u + r (n unknowns).
+With colour vectors e_c (ones every S cells, S ≥ 2w+1 = number of stencil points, w the half-bandwidth) one gets A e_c = R(e_c) - R(0),
+hence diag(A) and the absolute row sums Σ_j |A_ij| in S residual evaluations.
+The residual is called as res!(R, u, args...), where u is the full solution array
+(including boundary entries) and `inner` indexes the n unknowns within u.
+"""
+function probe(res!, u, inner, args...; S=3)
+    n  = length(inner)
+    u  = copy(u)          # work copy: the solution array is left untouched
+    R0, Rp, e = zeros(n), zeros(n), zeros(n)
+    D, A = zeros(n), zeros(n)
+    u[inner] .= 0.0
+    res!(R0, u, args...)
+    for c in 1:S
+        e .= 0.0; e[c:S:n] .= 1.0
+        u[inner] .= e
+        res!(Rp, u, args...); Rp .-= R0
+        for i in c:S:n 
+            D[i] = Rp[i]
+        end
+        A .+= abs.(Rp)
+    end
+    return D, A
+end
+
+"""
+Diagonal preconditioner and Gershgorin estimate of λmax of the preconditioned operator,
+both obtained by probing the residual function res!(R, u, args...) (see `probe`).
+"""
+function preconditioner_and_λmax(preconditioning, res!, u, inner, args...)
+    N    = length(inner)
+    # Probed diagonal D (negative here) and absolute row sums A of the Jacobian
+    D, A = probe(res!, u, inner, args...)
+    # Diagonal preconditioner
+    PC   = preconditioning ? -D : ones(N)
+    # Maximum eigenvalue: Gershgorin circle theorem (preconditioned system)
+    λmax = A ./ PC
+    return PC, λmax
+end
+
+"""
+Rayleigh-quotient estimate of λmin of the preconditioned operator P⁻¹(-A) (e.g., Joldes et al., 2011):
+λ = -Δuᵀ(R - R0) / (Δuᵀ P Δu), with Δu = u_k - u_{k-1} the increment that produced R - R0 = A Δu.
+Δu is recovered from the pseudo-rate update (α, β unchanged since then):
+Δu = α ∂u∂τ_old = (α/β)(∂u∂τ - R/PC).
+"""
+function λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β)
+    Δu = (α/β) .* (∂u∂τ .- R./PC)
+    return abs(sum(Δu .* (R .- R0))) / sum(Δu .* PC .* Δu)
+end
+
+"""
+AR-DR (adaptive-restart dynamic relaxation): replaces the λmin-based damping by a momentum ramp
+β_k = (k-1)/(k+2), with k the number of iterations since the last restart, and
+α_k = Δτ²(1+β_k)/2, i.e. the heavy-ball step at the stability limit for β_k (needs λmax only).
+The restart (k = 1, hence β = 0) is triggered when the momentum no longer points along the
+preconditioned residual, Rᵀ ∂u∂τ < 0 (O'Donoghue & Candès, 2015). The test is a global reduction,
+done every nrestart iterations: 5-10 is as good as every iteration, while checking only every
+nout = 100 iterations stalls in nonlinear problems.
+"""
+ardr_coefficients(k, Δτ) = (β = (k-1)/(k+2); (Δτ^2*(1+β)/2, β))
+
+"""
+FD Residual of Poisson problem in 1D (Dirichlet BC's via ghost nodes)
+"""
+function Residual_FD_1D!(R, u, q, k, b, uBC, Δx,   ∂u∂x, k_ref, nonlinear, n)
+    # Set boundary conditions
+    u[1]   = 2*uBC.W - u[2]
+    u[end] = 2*uBC.E - u[end-1]
+    # Non linear coefficient
+    if nonlinear 
+        non_linearity!(k, ∂u∂x, u, k_ref, Δx, n=n) 
+    end
+    # Flux
+    @views q .= .-k .* (u[2:end] .- u[1:end-1]) ./ Δx
+    # Residual
+    @views R .= .-(q[2:end] .- q[1:end-1]) ./ Δx .- b
+    return nothing
+end
+
+function main(; n=1.0, ncx, preconditioning, tol, 𝐶, c_fact, nout, ardr=false, nrestart=10)
+
+    # Definition of computation domain
+    L    = 1.0
+    Δx   = L/ncx
+    xc   = LinRange(-L/2+Δx/2, L/2-Δx/2, ncx)
+    xv   = LinRange(-L/2, L/2, ncx+1)
+
+    # Boundaries conditions (Dirichlet)
+    uBC  = (W=1.0, E=2.0)
+    
+    # Allocations
+    b    = zeros(ncx+0)
+    u    = zeros(ncx+2)
+    ∂u∂x = zeros(ncx+1)
+    k    = zeros(ncx+1) 
+    q    = zeros(ncx+1)
+    k    =  ones(ncx+1)
+    R    = zeros(ncx+0)
+    R0   = zeros(ncx+0)
+    ∂u∂τ = zeros(ncx+0)
+
+    # Coefficient
+    k    = @.  1 + 100 * ( (1 + exp(-200 * (xv + 0.1)))^(-1)  - (1 + exp(-200 * (xv - 0.1)))^(-1) )    
+    k_ref = copy(k)
+
+    # Initiate
+    u    .= 0.0
+    ∂u∂τ .= 0.0
+
+    # Diagonal preconditioner and maximum eigenvalue (preconditioned system), from probing
+    non_linearity!(k, ∂u∂x, u, k_ref, Δx, n=n)
+    PC, λmax = preconditioner_and_λmax(preconditioning, Residual_FD_1D!, u, 2:ncx+1, q, k, b, uBC, Δx, ∂u∂x, k_ref, false, n)
+    
+    # Pseudo time step is proportional to λmax (e.g., Oakley, 1995)
+    Δτ    = 2 / sqrt(maximum(λmax)) * 𝐶
+
+    # Damping coefficient is proportional to λmin (e.g., Oakley, 1995)
+    λmin  = 0.          # wild guess  
+    c     = 2*sqrt.(λmin)*0.5
+    α     = 2 .* Δτ^2 ./ (2 .+ c.*Δτ)
+    β     = (2 .- c.*Δτ) ./ (2 .+ c.*Δτ)  
+
+    # Iteration loop 
+    iter, err, err0 = 0,  1.0, 1.0
+    k_rs = 0            # AR-DR: iterations since last restart
+    err_vec, iter_vec = [], []
+
+    while err > tol
+
+        # Increment iteration count
+        iter  += 1
+
+        # Previous residual
+        R0    .= R  
+
+        # Residual
+        Residual_FD_1D!(R, u, q, k, b, uBC, Δx, ∂u∂x, k_ref, true, n)
+
+        # AR-DR: momentum ramp with adaptive restart
+        if ardr
+            # restart test (one reduction) only every nrestart iterations
+            k_rs = (iter > 1 && mod(iter, nrestart) == 0 && sum(R .* ∂u∂τ) < 0) ? 1 : k_rs + 1
+            α, β = ardr_coefficients(k_rs, Δτ)
+        end
+
+        # Pseudo-rate update
+        ∂u∂τ        .= β*∂u∂τ .+ R./PC      # Achtung: preconditioned system
+
+        # Solution update
+        u[2:end-1] .+= α*∂u∂τ
+
+        if mod(iter, nout)==0 || iter==1
+            # Residual check 
+            (iter == 1) && (err0 = norm(R))
+            err   = norm(R)/err0
+            @show err
+            push!(err_vec, err)
+            push!(iter_vec, iter)
+            isnan(err) && error("nan $(iter)")
+            # Rayleigh quotient (e.g., Joldes et al., 2011)
+            (iter > 1 && !ardr) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
+            # Diagonal preconditioner and maximum eigenvalue (preconditioned system), from probing
+            non_linearity!(k, ∂u∂x, u, k_ref, Δx, n=n)
+            PC, λmax = preconditioner_and_λmax(preconditioning, Residual_FD_1D!, u, 2:ncx+1, q, k, b, uBC, Δx, ∂u∂x, k_ref, false, n)
+            # Pseudo time step is proportional to λmax (e.g., Oakley, 1995)
+            Δτ    = 2 / sqrt(maximum(λmax)) * 𝐶
+            # Dynamic evaluation of PT iteration parameters
+            c = 2*sqrt.(λmin)*c_fact
+            α = 2 .* Δτ^2 ./ (2 .+ c.*Δτ)
+            β = (2 .- c.*Δτ) ./ (2 .+ c.*Δτ)
+        end
+    end
+
+    return (xc=xc, xv=xv, u=u, k=k, b=b, PC=PC, λmax=λmax), err_vec, iter_vec
+end 
+
+#-------------------------------------------------------#
+
+let
+    n      = 1.5
+    ncx    = 800
+    𝐶      = 0.9
+    c_fact = 0.9
+    sol, err_vec, iter_vec = main(; n = n, ncx=ncx, ardr=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+end
+
+# let
+#     ncx    = 400
+#     𝐶      = 0.99
+#     c_fact = 0.9     # best for the increment-based Rayleigh quotient (0.7 with the former estimate)
+
+#     # Case 2: variable coefficient  
+#     sol, err_vec, iter_vec = main(; ncx=ncx, variable_coefficient=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+#     display(maximum(iter_vec))
+
+#     # Visualization
+#     fig = Figure(size = (500, 500), fontsize=18)
+#     ax1 = Axis(fig[1, 1], title=L"$$ (a) Solution field", xlabel=L"$x$", ylabel=L"$u$")
+#     scatter!(ax1, sol.xc[1:10:end], sol.u[2:10:end-1], label=L"$$FDM", color=:blue)
+#     axislegend(ax1, position = :lt, framevisible=false, labelsize=14)  # right-top
+
+#     ax2 = Axis(fig[1, 2], title=L"$$ (b) Coefficient", xlabel=L"$x$", ylabel=L"$k$")
+#     scatter!(ax2, sol.xv, sol.k, label=L"$$FDM", color=:blue)
+#     # axislegend(ax2, position = :lt, framevisible=false, labelsize=14)  # right-top
+
+#     #-------------------------------------------------------#
+
+#     ax3 = Axis(fig[2, 1], title=L"$$ (c) Convergence history", xlabel=L"$10^3$ iterations", ylabel=L"$\log_{10}$ relative residual")
+
+#     # Variable coefficient - preconditioning 
+#     ncx = 200
+#     sol, err_vec, iter_vec = main(; ncx=ncx, variable_coefficient=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+#     scatter!(ax3, iter_vec./1000, log10.(err_vec), label=L"$$ncx = 200", color=:blue)
+
+#     ncx = 400
+#     sol, err_vec, iter_vec = main(; ncx=ncx, variable_coefficient=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+#     scatter!(ax3, iter_vec./1000, log10.(err_vec), label=L"$$ncx = 400", color=:green)
+
+#     ncx = 800
+#     sol, err_vec, iter_vec = main(; ncx=ncx, variable_coefficient=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+#     scatter!(ax3, iter_vec./1000, log10.(err_vec), label=L"$$ncx = 800", color=:orange)
+
+#     axislegend(ax3, position = :rt, framevisible=false, labelsize=14)  # right-top
+
+#     # #-------------------------------------------------------#
+
+#     ax4 = Axis(fig[2, 2], title=L"$$ (d) Scaling", xlabel=L"$\log_{10}$ resolution", ylabel=L"$\log_{10}$ iterations")
+
+#     ncx             = 100:100:2000
+#     iter_count_FD   = zeros(length(ncx)) 
+
+#     for n in eachindex(ncx)
+#         sol, err_vec, iter_vec = main(; ncx=ncx[n], variable_coefficient=true, preconditioning=true, tol=1e-10, 𝐶=𝐶, c_fact=c_fact, nout=100)
+#         iter_count_FD[n]   = maximum(iter_vec)
+#     end
+
+#     scatter!(ax4, log10.(ncx), log10.(iter_count_FD), color=:blue, label=L"$$FDM")
+#     lines!(ax4, log10.(ncx), log10.(ncx).+1, linestyle=:dash, color=:black, label=L"$$O(1)")
+#     ylims!(2.9,5.2)
+#     axislegend(ax4, position = :lt, framevisible=false, labelsize=14, nbanks=2)  # right-top
+
+#     display(fig)
+#     # save("./img/BasicDyRel.png", fig, px_per_unit = 4) 
+# end
