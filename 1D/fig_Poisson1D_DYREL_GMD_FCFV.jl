@@ -172,6 +172,9 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
         # Residual
         Residual_FCFV_1D!(R, uh, uel, k, qxel, αe, Ωe, Γ, τ, nx1, nx2)
        
+        # AR-DR: adaptive restart (O'Donoghue & Candès, 2015), tested before the pseudo-rate update
+        ardr && mod(iter, nout)==0 && (sum(R .* ∂u∂τ) < 0) && (∂u∂τ .= 0.0; k_rs = 0)
+
         # AR-DR: β ramp
         k_rs += 1
         ardr && ((α, β) = ardr_coefficients(k_rs, Δτ))
@@ -189,11 +192,7 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
             push!(err_vec, err)
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
-            if ardr
-                # Adaptive restart (O'Donoghue & Candès, 2015): momentum no longer points along the residual
-                (sum(R .* ∂u∂τ) < 0) && (∂u∂τ .= 0.0; k_rs = 0)
-                continue
-            end
+            ardr && continue
             # Rayleigh quotient (e.g., Joldes et al., 2011)
             (iter > 1) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters
@@ -264,6 +263,9 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout,
         # Residual
         Residual_FD_1D!(R, u, q, k, b, uBC, Δx)
 
+        # AR-DR: adaptive restart (O'Donoghue & Candès, 2015), tested before the pseudo-rate update
+        ardr && mod(iter, nout)==0 && (sum(R .* ∂u∂τ) < 0) && (∂u∂τ .= 0.0; k_rs = 0)
+
         # AR-DR: β ramp
         k_rs += 1
         ardr && ((α, β) = ardr_coefficients(k_rs, Δτ))
@@ -281,11 +283,7 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout,
             push!(err_vec, err)
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
-            if ardr
-                # Adaptive restart (O'Donoghue & Candès, 2015): momentum no longer points along the residual
-                (sum(R .* ∂u∂τ) < 0) && (∂u∂τ .= 0.0; k_rs = 0)
-                continue
-            end
+            ardr && continue
             # Rayleigh quotient (e.g., Joldes et al., 2011)
             (iter > 1) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters

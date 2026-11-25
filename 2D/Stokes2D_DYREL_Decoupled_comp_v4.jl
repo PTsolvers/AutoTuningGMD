@@ -8,6 +8,8 @@ import Plots as pt
 @views av_xa(A) =  0.5*(A[1:end-1,:].+A[2:end,:])
 @views av_ya(A) =  0.5*(A[:,1:end-1].+A[:,2:end])
 @views av4_harm(A) = 1.0./( 0.25.*(1.0./A[1:end-1,1:end-1].+1.0./A[2:end,1:end-1].+1.0./A[1:end-1,2:end].+1.0./A[2:end,2:end]) ) 
+# ‖∇(γ Rp)‖: momentum-residual jump caused by the next PH update (ph_inner = :balanced)
+@views penalty_jump_norm(γRp, Δx, Δy) = sqrt(sum(abs2, diff(γRp, dims=1))/Δx^2 + sum(abs2, diff(γRp, dims=2))/Δy^2)
 
 # can be replaced by AD
 function Gershgorin_Stokes2D_SchurComplement(ηc, ηv, γ, Δx, Δy, ncx  ,ncy)
@@ -51,7 +53,12 @@ function Gershgorin_Stokes2D_SchurComplement(ηc, ηv, γ, Δx, Δy, ncx  ,ncy)
 end
 
 # 2D Stokes routine
-@views function Stokes2D(n)
+#   ph_inner — inner stopping rule, :rel_drop or :balanced (‖R_V‖ ≤ σ_inner‖∇(γ Rp)‖)
+#   nout     — check frequency
+#   dτ_local — local pseudo-time step
+#   maxit_nx — cap on total iterations / nx
+#   ardr     — AR-DR instead of λmin-based damping (see 1D/DR_vs_HeavyBall.tex)
+@views function Stokes2D(n; ph_inner = :balanced, σ_inner = 0.3, nout = 100, ardr = false, dτ_local = true, maxit_nx = Inf, show = true)
     # Physics
     Lx, Ly   = 1.0, 1.0     # domain size
     radi     = 0.2          # inclusion radius
@@ -67,9 +74,7 @@ end
     ncx, ncy = n*31, n*31   # numerical grid resolution
     ϵ        = 1e-9         # tolerance
     iterMax  = 1e5          # max number of iters
-    nout     = 100          # check frequency
     c_fact   = 0.5          # damping factor
-    dτ_local = true         # helps a little bit sometimes, sometimes not! 
     γfact    = 60           # penalty: multiplier to the arithmetic mean of η
     rel_drop = 1e-3         # relative drop of velocity residual per PH iteration
     # Preprocessing
@@ -154,6 +159,7 @@ end
         γ_eff = ηb
         γ_num = ηb
         rel_drop = 1e-13
+        ph_inner = :rel_drop
     end
     ##########################################
 
@@ -180,6 +186,8 @@ end
     errVx0 = 1.0;  errVy0 = 1.0;  errPt0 = 1.0 
     errVx00= 1.0;  errVy00= 1.0; 
     iter=1; err=2*ϵ; err_evo_V=[]; err_evo_P=[]; err_evo_it=[]
+    ph_evo_it = Int[]; ph_evo_err = Float64[]   # residual at each PH iteration
+    k_rs = 0                                    # AR-DR: iterations since last restart
     @time for itPH = 1:50
         # Boundaries
         Vx[:,1] .= Vx[:,2]; Vx[:,end] .= Vx[:,end-1]
@@ -202,12 +210,18 @@ end
         errVx = norm(Rx); errVy = norm(Ry); errPt = norm(Rp)
         if itPH==1 errVx0=errVx; errVy0=errVy; errPt0=errPt; end
         err = maximum([errVx/errVx0, errVy/errVy0, errPt/errPt0])
+        push!(ph_evo_it, iter); push!(ph_evo_err, err)
         @printf("itPH = %02d iter = %06d iter/nx = %03d, err = %1.3e norm[Rx=%1.3e, Ry=%1.3e, Rp=%1.3e] \n", itPH, iter, iter/ncx, err, errVx/errVx0, errVy/errVy0, errPt/errPt0)
         if (err<ϵ) break end
-        # Set tolerance of velocity solve proportional to residual
-        ϵ_vel = err*rel_drop
+        (err > 1e3 || !isfinite(err)) && (@warn "diverged at itPH = $itPH"; break)
+        iter > maxit_nx*ncx && (@warn "iteration cap reached at itPH = $itPH"; break)
+        # Velocity tolerance: proportional to residual (:rel_drop) or balanced against the
+        # next pressure update (:balanced, falls back to :rel_drop once Rp < ϵ)
+        use_balanced   = ph_inner === :balanced && errPt/errPt0 > ϵ
+        ϵ_vel = use_balanced ? 0.0 : err*rel_drop
+        inner_balanced = false
         itPT = 0.
-        while (err>ϵ_vel && itPT<=iterMax)
+        while (err>ϵ_vel && !inner_balanced && itPT<=iterMax && iter <= maxit_nx*ncx)
             itPT   += 1
             itg    = iter
             # Pseudo-old dudes 
@@ -230,6 +244,16 @@ end
             # Residuals
             Rx    .= (1.0./Dx).*(.-(Pt[2:end,:] .- Pt[1:end-1,:])./Δx .+ (Txx[2:end,:] .- Txx[1:end-1,:])./Δx .+ (Txy[2:end-1,2:end] .- Txy[2:end-1,1:end-1])./Δy)
             Ry    .= (1.0./Dy).*(.-(Pt[:,2:end] .- Pt[:,1:end-1])./Δy .+ (Tyy[:,2:end] .- Tyy[:,1:end-1])./Δy .+ (Txy[2:end,2:end-1] .- Txy[1:end-1,2:end-1])./Δx)
+            # AR-DR: β ramp + adaptive restart (α = momentum, β·dτ = step here)
+            if ardr
+                # Restart test before the momentum update, otherwise R⋅R/D > 0 biases it
+                if mod(iter, nout)==0 && sum((Dx.*Rx).*dVxdτ) + sum((Dy.*Ry).*dVydτ) < 0
+                    dVxdτ .= 0.0; dVydτ .= 0.0; k_rs = 0
+                end
+                k_rs += 1; mom = (k_rs - 1)/(k_rs + 2)
+                αVx .= mom; αVy .= mom
+                βVx .= dτVx.*(1 + mom)./2; βVy .= dτVy.*(1 + mom)./2
+            end
             # Damping-pong
             dVxdτ .= αVx.*dVxdτ .+ Rx
             dVydτ .= αVy.*dVydτ .+ Ry
@@ -241,7 +265,12 @@ end
                 errVx = norm(Dx.*Rx); errVy = norm(Dy.*Ry)
                 if iter==nout errVx00=errVx; errVy00=errVy; end
                 err = maximum([min(errVx, errVx./errVx00), min(errVy, errVy./errVy00)])
+                use_balanced && (inner_balanced = sqrt(errVx^2 + errVy^2) <= σ_inner*penalty_jump_norm(γ_eff.*Rp, Δx, Δy))
                 push!(err_evo_V, errVx/errVx00); push!(err_evo_P, errPt/errPt0); push!(err_evo_it, itg)
+                if ardr
+                    iter += 1
+                    continue
+                end
                 dVx .= dVxdτ.*βVx.*dτVx
                 dVy .= dVydτ.*βVy.*dτVy
                 # @printf("iter = %d, err = %1.3e norm[Rx=%1.3e, Ry=%1.3e] \n", iter, err, errVx, errVy)
@@ -266,7 +295,7 @@ end
     p3 = pt.plot!(err_evo_it/ncx, log10.(err_evo_V), label="V")
     p3 = pt.plot!(err_evo_it/ncx, log10.(err_evo_P), label="P")
     p4 = pt.heatmap(xc, yc, log10.(ηc)' , aspect_ratio=1, c=:inferno, title="ηc", xlims=(-Lx/2,Lx/2), xlabel="x", ylabel="y")
-    display(pt.plot(p1, p2, p3, p4))
+    show && display(pt.plot(p1, p2, p3, p4))
 
     @show iter/ncx
     n   = length(ηc)
@@ -274,8 +303,10 @@ end
     @show η_g = exp( sum( 1.0/n*log.(ηc)))
     @show η_a = mean(ηc)
 
-    return
+    return (; ncx, iter, nPH = length(ph_evo_it), converged = err < ϵ, ϵ, ph_evo_it, ph_evo_err)
 end
 
-n = 8
-Stokes2D(n)
+if abspath(PROGRAM_FILE) == (@__FILE__) || isinteractive()
+    n = 8
+    Stokes2D(n)
+end
