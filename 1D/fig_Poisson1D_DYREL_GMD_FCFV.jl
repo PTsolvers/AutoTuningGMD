@@ -11,12 +11,12 @@ Makie.update_theme!( fonts = (regular = texfont(), bold = texfont(:bold), italic
 
 """
 Matrix-free probing of an affine residual R(u) = A u + r (n unknowns).
-With colour vectors e_c (ones every S cells, S > stencil width) one gets A e_c = R(e_c) - R(0),
+With colour vectors e_c (ones every S cells, S ≥ 2w+1 = number of stencil points, w the half-bandwidth) one gets A e_c = R(e_c) - R(0),
 hence diag(A) and the absolute row sums Σ_j |A_ij| in S residual evaluations.
 The residual is called as res!(R, u, args...), where u is the full solution array
 (including boundary entries) and `inner` indexes the n unknowns within u.
 """
-function probe(res!, u, inner, args...; S=5)
+function probe(res!, u, inner, args...; S=3)
     n  = length(inner)
     u  = copy(u)          # work copy: the solution array is left untouched
     R0, Rp, e = zeros(n), zeros(n), zeros(n)
@@ -62,6 +62,17 @@ function λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β)
 end
 
 """
+AR-DR (adaptive-restart dynamic relaxation): replaces the λmin-based damping by a momentum ramp
+β_k = (k-1)/(k+2), with k the number of iterations since the last restart, and
+α_k = Δτ²(1+β_k)/2, i.e. the heavy-ball step at the stability limit for β_k (needs λmax only).
+The restart (k = 1, hence β = 0) is triggered when the momentum no longer points along the
+preconditioned residual, Rᵀ ∂u∂τ < 0 (O'Donoghue & Candès, 2015). The test is a global reduction,
+done every nrestart iterations: 5-10 is as good as every iteration, while checking only every
+nout = 100 iterations stalls in nonlinear problems.
+"""
+ardr_coefficients(k, Δτ) = (β = (k-1)/(k+2); (Δτ^2*(1+β)/2, β))
+
+"""
 FD Residual of Poisson problem in 1D (Dirichlet BC's via ghost nodes)
 """
 function Residual_FD_1D!(R, u, q, k, b, uBC, Δx)
@@ -96,7 +107,7 @@ function Residual_FCFV_1D!(f,H,Hel,kel,qxel,αe,Ωe,Γ,τ,nx1,nx2)
     return nothing
 end
 
-function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout)
+function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout, ardr=false, nrestart=10)
 
     # Definition of computation domain
     L    = 1.0
@@ -149,6 +160,7 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
 
     # Iteration loop 
     iter, err, err0 = 0,  1.0, 1.0
+    k_rs = 0            # AR-DR: iterations since last restart
     err_vec, iter_vec = [], []
 
     while err > tol
@@ -162,6 +174,13 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
         # Residual
         Residual_FCFV_1D!(R, uh, uel, k, qxel, αe, Ωe, Γ, τ, nx1, nx2)
        
+        # AR-DR: momentum ramp with adaptive restart
+        if ardr
+            # restart test (one reduction) only every nrestart iterations
+            k_rs = (iter > 1 && mod(iter, nrestart) == 0 && sum(R .* ∂u∂τ) < 0) ? 1 : k_rs + 1
+            α, β = ardr_coefficients(k_rs, Δτ)
+        end
+
         # Pseudo-rate update
         ∂u∂τ        .= β*∂u∂τ .+ R./PC      # Achtung: preconditioned system
 
@@ -176,7 +195,7 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
             # Rayleigh quotient (e.g., Joldes et al., 2011)
-            (iter > 1) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
+            (iter > 1 && !ardr) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters
             c = 2*sqrt.(λmin)*c_fact
             α = 2 .* Δτ^2 ./ (2 .+ c.*Δτ)
@@ -188,7 +207,7 @@ function main_FCFV(;ncx, variable_coefficient, preconditioning, tol, c_fact, nou
 
 end 
 
-function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout)
+function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout, ardr=false, nrestart=10)
 
     # Definition of computation domain
     L    = 1.0
@@ -231,6 +250,7 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout)
 
     # Iteration loop 
     iter, err, err0 = 0,  1.0, 1.0
+    k_rs = 0            # AR-DR: iterations since last restart
     err_vec, iter_vec = [], []
 
     while err > tol
@@ -243,6 +263,13 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout)
 
         # Residual
         Residual_FD_1D!(R, u, q, k, b, uBC, Δx)
+
+        # AR-DR: momentum ramp with adaptive restart
+        if ardr
+            # restart test (one reduction) only every nrestart iterations
+            k_rs = (iter > 1 && mod(iter, nrestart) == 0 && sum(R .* ∂u∂τ) < 0) ? 1 : k_rs + 1
+            α, β = ardr_coefficients(k_rs, Δτ)
+        end
 
         # Pseudo-rate update
         ∂u∂τ        .= β*∂u∂τ .+ R./PC      # Achtung: preconditioned system
@@ -258,7 +285,7 @@ function main_FD(;ncx, variable_coefficient, preconditioning, tol, c_fact, nout)
             push!(iter_vec, iter)
             isnan(err) && error("nan $(iter)")
             # Rayleigh quotient (e.g., Joldes et al., 2011)
-            (iter > 1) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
+            (iter > 1 && !ardr) && (λmin = λmin_Rayleigh(R, R0, ∂u∂τ, PC, α, β))
             # Dynamic evaluation of PT iteration parameters
             c = 2*sqrt.(λmin)*c_fact
             α = 2 .* Δτ^2 ./ (2 .+ c.*Δτ)
